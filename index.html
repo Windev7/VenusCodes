@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Venus: Online Collaborative Code Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .editor-container {
+            height: calc(100vh - 80px); /* Full height minus header */
+            display: flex;
+            gap: 16px;
+            padding: 16px;
+        }
+        .code-input, .output-frame {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        textarea {
+            flex-grow: 1;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            padding: 1rem;
+            resize: none;
+            outline: none;
+            background-color: #1f2937; /* Dark BG */
+            color: #d1d5db; /* Light text */
+            line-height: 1.5;
+            caret-color: #60a5fa;
+            border: none;
+        }
+        iframe {
+            flex-grow: 1;
+            background-color: white;
+            border: none;
+        }
+        .sidebar {
+            width: 300px;
+            max-height: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .help-panel {
+            background-color: #e5e7eb;
+            border-radius: 12px;
+            padding: 1rem;
+            overflow-y: auto;
+            flex-grow: 1;
+            transition: max-height 0.3s ease-out;
+            max-height: 100%;
+        }
+        .collaboration-panel {
+            background-color: #f3f4f6;
+            border-radius: 12px;
+            padding: 1rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .button {
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        .button-primary {
+            background-color: #10b981;
+            color: white;
+        }
+        .button-primary:hover {
+            background-color: #059669;
+            transform: translateY(-1px);
+        }
+        .button-secondary {
+            background-color: #60a5fa;
+            color: white;
+        }
+        .button-secondary:hover {
+            background-color: #3b82f6;
+            transform: translateY(-1px);
+        }
+        @media (max-width: 1024px) {
+            .editor-container {
+                flex-direction: column;
+                height: auto;
+                padding-bottom: 80px;
+            }
+            .code-input, .output-frame {
+                min-height: 400px;
+            }
+            .sidebar {
+                width: 100%;
+                max-height: 600px;
+            }
+        }
+    </style>
+
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // IMPORTANT: Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const API_KEY = ""; // Placeholder for LLM API Key
+
+        // Global State
+        window.app = null;
+        window.db = null;
+        window.auth = null;
+        window.userId = null;
+        window.isAuthReady = false;
+        window.isEditorSyncing = false;
+        window.HELP_COMMANDS = [];
+
+        // UI Elements
+        const codeEditor = document.getElementById('code-editor');
+        const outputFrame = document.getElementById('output-frame');
+        const helpPanel = document.getElementById('help-panel');
+        const helpContent = document.getElementById('help-content');
+        const authStatus = document.getElementById('auth-status');
+        const userIdDisplay = document.getElementById('user-id');
+        const collaborationText = document.getElementById('collaboration-text');
+        const helpButton = document.getElementById('help-button');
+        const runButton = document.getElementById('run-button');
+        const sourceButton = document.getElementById('source-button');
+
+        // --- Utility Functions ---
+
+        // Debounce function to limit Firestore write rate
+        function debounce(func, delay) {
+            let timeout;
+            return function(...args) {
+                const context = this;
+                clearTimeout(timeout);
+                timeout = setTimeout(() => func.apply(context, args), delay);
+            };
+        }
+
+        // --- Core Application Logic ---
+
+        // 1. Firebase Initialization and Authentication
+        async function initFirebaseAndAuth() {
+            setLogLevel('debug');
+            if (Object.keys(firebaseConfig).length === 0) {
+                console.error("Firebase config is missing. Using static mode.");
+                authStatus.textContent = 'Status: Offline (Config Missing)';
+                window.isAuthReady = true; // Still allow app to run locally
+                return;
+            }
+
+            try {
+                window.app = initializeApp(firebaseConfig);
+                window.db = getFirestore(window.app);
+                window.auth = getAuth(window.app);
+
+                // Sign in using custom token or anonymously
+                if (initialAuthToken) {
+                    await signInWithCustomToken(window.auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(window.auth);
+                }
+
+                // Wait for auth state change to confirm user ID
+                onAuthStateChanged(window.auth, (user) => {
+                    if (user) {
+                        window.userId = user.uid;
+                        authStatus.textContent = 'Status: Online (Signed In)';
+                        userIdDisplay.textContent = window.userId;
+                        console.log("Authenticated with User ID:", window.userId);
+                        window.isAuthReady = true;
+                        setupCollaboration();
+                    } else {
+                        window.userId = crypto.randomUUID(); // Fallback to local ID
+                        authStatus.textContent = 'Status: Offline (Anonymous)';
+                        userIdDisplay.textContent = window.userId;
+                        window.isAuthReady = true;
+                        console.log("Signed in anonymously. Using local ID:", window.userId);
+                        setupCollaboration(); // Still set up, but with local ID
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase setup or sign-in failed:", error);
+                authStatus.textContent = 'Status: Error';
+            }
+        }
+
+        // 2. Real-time Collaboration (Firestore)
+        function setupCollaboration() {
+            if (!window.isAuthReady || !window.db) {
+                console.warn("Firestore not ready. Skipping collaboration setup.");
+                return;
+            }
+
+            // Public path for the shared 'main' project
+            const projectDocRef = doc(window.db, 'artifacts', appId, 'public', 'data', 'venus_projects', 'main_project');
+
+            // Set up real-time listener
+            onSnapshot(projectDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    const currentCode = codeEditor.value;
+
+                    // Only update the editor if the remote code is different
+                    if (data.code !== currentCode) {
+                        // Prevent infinite loop by not updating the remote code on the next input event
+                        window.isEditorSyncing = true;
+                        codeEditor.value = data.code;
+                        compileVenus();
+                        collaborationText.textContent = `Last updated by: ${data.last_user || 'System'}`;
+
+                        // Release the lock after a small delay
+                        setTimeout(() => {
+                            window.isEditorSyncing = false;
+                        }, 50);
+                    }
+                } else {
+                    // Initialize the document if it doesn't exist
+                    console.log("Project document not found, initializing...");
+                    updateRemoteCode.call(null, codeEditor.value);
+                }
+            }, (error) => {
+                console.error("Error listening to collaboration document:", error);
+                collaborationText.textContent = 'Collaboration Error';
+            });
+        }
+
+        // Function to write code changes to Firestore (Debounced)
+        const updateRemoteCode = debounce(async (newCode) => {
+            if (!window.db || !window.userId || window.isEditorSyncing) {
+                return;
+            }
+
+            try {
+                const projectDocRef = doc(window.db, 'artifacts', appId, 'public', 'data', 'venus_projects', 'main_project');
+                await setDoc(projectDocRef, {
+                    code: newCode,
+                    last_user: window.userId,
+                    timestamp: new Date().toISOString()
+                }, { merge: true });
+                collaborationText.textContent = `Code synced...`;
+            } catch (error) {
+                console.error("Failed to write to Firestore:", error);
+                collaborationText.textContent = 'Sync Failed';
+            }
+        }, 500); // 500ms debounce
+
+        // Event listener for editor changes
+        codeEditor.addEventListener('input', (e) => {
+            if (window.isEditorSyncing) return;
+            // Instantly compile locally
+            compileVenus();
+            // Debounced update to remote
+            updateRemoteCode(e.target.value);
+            collaborationText.textContent = 'Typing...';
+        });
+
+        // 3. Venus Language Engine (Compiler)
+        function compileVenus() {
+            const venusCode = codeEditor.value;
+            // For simplicity and to be "based on HTML", we wrap the code with basic HTML structure.
+            // Advanced Venus features could be implemented here (e.g., regex replacing custom commands).
+            const htmlContent = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Venus Output</title>
+                    <style>
+                        body { font-family: sans-serif; padding: 20px; }
+                        h1, h2, h3 { color: #3b82f6; }
+                        button { padding: 8px 16px; background-color: #10b981; color: white; border: none; border-radius: 4px; cursor: pointer; }
+                    </style>
+                </head>
+                <body>
+                    ${venusCode}
+                </body>
+                </html>
+            `;
+            outputFrame.contentWindow.document.open();
+            outputFrame.contentWindow.document.write(htmlContent);
+            outputFrame.contentWindow.document.close();
+        }
+
+        // 4. UI Actions
+
+        // Toggle help panel visibility and load commands if necessary
+        function toggleHelp() {
+            const isVisible = helpPanel.classList.toggle('hidden');
+            helpButton.textContent = isVisible ? 'Show Help (HELP)' : 'Hide Help (HELP)';
+
+            if (!isVisible && window.HELP_COMMANDS.length === 0) {
+                loadHelpCommands();
+            }
+        }
+
+        // Display Source Code Modal
+        function displaySource() {
+            const code = codeEditor.value;
+            const modal = document.getElementById('source-modal');
+            const sourceCodePre = document.getElementById('source-code-pre');
+            sourceCodePre.textContent = code;
+            modal.classList.remove('hidden');
+        }
+
+        function closeModal() {
+            document.getElementById('source-modal').classList.add('hidden');
+        }
+
+        // 5. Load 100 Commands using LLM API
+        async function loadHelpCommands() {
+            helpContent.innerHTML = '<div class="text-center py-4 text-gray-600">Loading 100 commands...</div>';
+
+            const systemPrompt = "You are a compiler assistant for a web-based language called Venus. Your task is to generate a comprehensive list of 100 commands and their descriptions that relate to generating web page elements and simple logic.";
+            const userQuery = "Generate a JSON array of 100 objects. Each object must have a 'command' (a capitalized, snake_case string, like CREATE_HEADING) and a 'description' (a short, descriptive sentence). These commands should be related to web development, specifically HTML elements, styling, and basic logic, using the format: command, description.";
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                "command": { "type": "STRING" },
+                                "description": { "type": "STRING" }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Simple retry mechanism with exponential backoff
+            const maxRetries = 3;
+            let attempts = 0;
+            let result = null;
+
+            while (attempts < maxRetries) {
+                try {
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${API_KEY}`;
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    result = await response.json();
+                    break; // Success, break out of loop
+
+                } catch (error) {
+                    attempts++;
+                    console.error(`Attempt ${attempts} failed:`, error.message);
+                    if (attempts >= maxRetries) {
+                        helpContent.innerHTML = `<div class="text-center py-4 text-red-600">Failed to load help commands after ${maxRetries} attempts. Please try again.</div>`;
+                        return;
+                    }
+                    // Exponential backoff
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 1000));
+                }
+            }
+
+
+            if (result && result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+
+                try {
+                    const jsonString = result.candidates[0].content.parts[0].text;
+                    window.HELP_COMMANDS = JSON.parse(jsonString);
+                } catch (e) {
+                    console.error("Failed to parse JSON response:", e);
+                    helpContent.innerHTML = `<div class="text-center py-4 text-red-600">Error parsing command data.</div>`;
+                    return;
+                }
+            } else {
+                console.error("LLM response structure was invalid.");
+                helpContent.innerHTML = `<div class="text-center py-4 text-red-600">Error: Received empty response from the command generator.</div>`;
+                return;
+            }
+
+            // Render the commands
+            let html = '<div class="space-y-4">';
+            window.HELP_COMMANDS.forEach((item, index) => {
+                html += `
+                    <div class="p-3 bg-white rounded-lg shadow-sm">
+                        <p class="font-mono text-sm text-blue-700">#${index + 1} &gt; ${item.command}</p>
+                        <p class="text-xs text-gray-600">${item.description}</p>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            helpContent.innerHTML = html;
+        }
+
+        // Initial setup calls
+        window.onload = () => {
+            initFirebaseAndAuth();
+            compileVenus(); // Initial render of empty state
+
+            // Attach event listeners to buttons
+            runButton.addEventListener('click', compileVenus);
+            helpButton.addEventListener('click', toggleHelp);
+            sourceButton.addEventListener('click', displaySource);
+            document.getElementById('close-modal').addEventListener('click', closeModal);
+
+            // Special keyword handling for "HELP"
+            codeEditor.addEventListener('keydown', (e) => {
+                if (e.key === 'P' && e.ctrlKey || e.key === 'p' && e.metaKey) {
+                    e.preventDefault();
+                    compileVenus();
+                }
+
+                // Simple check for 'HELP' being typed alone (not perfect, but covers the request)
+                const value = codeEditor.value.trim().toUpperCase();
+                if (value === 'HELP' && (e.key === 'Enter' || e.key === ' ')) {
+                    e.preventDefault();
+                    toggleHelp();
+                    // Optional: remove 'HELP' after trigger
+                    // codeEditor.value = codeEditor.value.replace(/HELP\s*$/i, '').trim();
+                }
+            });
+        };
+    </script>
+</head>
+<body class="bg-gray-50">
+
+    <!-- Header / Navbar -->
+    <header class="bg-gray-900 text-white p-3 shadow-lg flex justify-between items-center">
+        <h1 class="text-xl font-bold tracking-widest text-green-400">VENUS &lt;CODE/&gt;</h1>
+        <div class="flex items-center space-x-4 text-sm">
+            <span id="auth-status" class="text-gray-400">Status: Initializing...</span>
+        </div>
+    </header>
+
+    <!-- Main Editor Area -->
+    <div class="editor-container">
+        <!-- Code Input & Controls -->
+        <div class="code-input bg-gray-700">
+            <div class="p-3 bg-gray-800 flex justify-between items-center rounded-t-xl">
+                <p class="text-lg font-semibold text-white">Venus Code Editor</p>
+                <div class="flex space-x-2">
+                    <button id="run-button" class="button button-primary">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 inline-block -mt-0.5" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 10 008 8v4a1 1 10 001.555.832l3-2a1 1 10 000-1.664l-3-2z" clip-rule="evenodd" />
+                        </svg>
+                        Run Code
+                    </button>
+                    <button id="source-button" class="button button-secondary">
+                        Display Source
+                    </button>
+                    <button id="help-button" class="button bg-indigo-500 hover:bg-indigo-600 text-white">
+                        Show Help (HELP)
+                    </button>
+                </div>
+            </div>
+            <textarea id="code-editor" spellcheck="false" placeholder="Write your Venus code here (based on HTML).
+Type 'HELP' and press space to view all commands.
+
+<H1>Hello Venus!</H1>
+<P>This text is shared in real-time.</P>
+<BUTTON onclick='alert(&quot;Clicked!&quot;)'>A Button</BUTTON>
+">
+<H1>Hello Venus!</H1>
+<P>This text is shared in real-time.</P>
+<BUTTON onclick='alert("Clicked!")'>A Button</BUTTON>
+</textarea>
+        </div>
+
+        <!-- Output and Sidebar -->
+        <div class="flex-shrink-0 flex flex-col gap-4 lg:w-1/3">
+            <!-- Code Output Frame -->
+            <div class="output-frame">
+                <div class="p-3 bg-gray-200 font-semibold text-gray-800 rounded-t-xl">Live Preview</div>
+                <iframe id="output-frame" sandbox="allow-scripts allow-forms allow-same-origin"></iframe>
+            </div>
+
+            <!-- Collaboration Info Panel -->
+            <div class="collaboration-panel">
+                <h3 class="font-bold text-gray-800 mb-2">Collaboration & Project Info</h3>
+                <p class="text-xs text-gray-600 break-words">Your User ID: <span id="user-id" class="font-mono text-indigo-700 text-sm">Loading...</span></p>
+                <p class="text-xs text-gray-600 break-words mt-2">Share this URL to collaborate!</p>
+                <p id="collaboration-text" class="text-sm font-medium text-green-600 mt-2">Connecting...</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Help Panel (Initially hidden, positioned absolutely for small screens) -->
+    <div id="help-panel" class="help-panel hidden fixed inset-0 z-50 p-4 bg-white/95 backdrop-blur-sm lg:relative lg:p-0 lg:bg-transparent lg:backdrop-blur-none lg:h-auto lg:z-auto lg:shadow-none lg:rounded-none lg:w-1/3 lg:flex-shrink-0 lg:flex lg:flex-col">
+        <div class="p-4 bg-blue-100 rounded-t-xl border-b-2 border-blue-200 flex justify-between items-center lg:rounded-t-lg lg:mt-0">
+            <h2 class="text-xl font-bold text-blue-700">Venus Commands (100)</h2>
+            <button onclick="document.getElementById('help-panel').classList.add('hidden')" class="lg:hidden text-blue-700 font-bold text-2xl">&times;</button>
+        </div>
+        <div id="help-content" class="p-4 overflow-y-auto bg-white rounded-b-xl flex-grow">
+            <!-- Commands will be loaded here by JavaScript -->
+            <div class="text-center py-4 text-gray-600">Loading 100 commands...</div>
+        </div>
+    </div>
+
+    <!-- Source Code Modal -->
+    <div id="source-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 hidden z-[100] flex items-center justify-center p-4">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col">
+            <div class="p-4 border-b flex justify-between items-center">
+                <h2 class="text-xl font-bold text-gray-800">Venus Project Source Code</h2>
+                <button id="close-modal" class="text-gray-500 hover:text-gray-700 font-bold text-2xl leading-none">&times;</button>
+            </div>
+            <div class="p-4 overflow-y-auto flex-grow bg-gray-800 rounded-b-xl">
+                <pre id="source-code-pre" class="text-green-300 text-sm whitespace-pre-wrap"></pre>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
